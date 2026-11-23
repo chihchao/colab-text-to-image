@@ -77,3 +77,8 @@ git clone https://github.com/chihchao/colab-text-to-image.git ~/.claude/skills/c
 ```bash
 ln -s "$PWD" ~/.claude/skills/colab-text-to-image
 ```
+
+## 授權
+本專案以 [MIT License](LICENSE) 授權。
+
+使用的模型和服務另有各自的授權與條款：SDXL-Turbo 採用 Stability AI 的 [SDXL-Turbo 授權](https://huggingface.co/stabilityai/sdxl-turbo)（商業用途需要另外確認），Colab 則適用 Google Colab 的服務條款。
