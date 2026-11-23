@@ -1,4 +1,4 @@
-# colab-cli-texttoimage-skill
+# colab-text-to-image
 
 用 Google 官方 Colab CLI（`google-colab-cli`）在 Colab GPU 上文字生圖，可以選 **SDXL-Turbo**（T4，快速又便宜）或 **Z-Image-Turbo**（L4，高品質，能畫中英文字），把圖片下載回本機，可以選擇自動去背（輸出透明 PNG），並自動驗證結果。可以當作 Claude Code skill 使用，也能讓其他 AI agent 或程式直接呼叫。
 
@@ -14,7 +14,7 @@
 - macOS 或 Linux（Colab CLI 不支援 Windows）
 - `python3`（3.8 以上），本機不需要另外安裝 Python 套件
 - 一個可以使用 Colab 的 Google 帳號；免費方案通常可以用 T4，但可用時數有限制
-- Z-Image-Turbo 需要 L4，要有 Colab compute units（付費方案，或 Google AI Pro / Ultra 附的額度）
+- Z-Image-Turbo 需要 L4，要有 Colab compute units（例如 Colab 付費方案；據報導 Google AI Pro / Ultra 也附有額度，但 Google 官方沒有明確說明）。可以用 `colab usage` 查看餘額
 
 ## 第一次使用
 ```bash
@@ -46,7 +46,7 @@ python3 scripts/t2i.py generate -p "two orange cats sleeping on a blue sofa, pho
 python3 scripts/t2i.py generate -m z-image-turbo -p 'a cozy coffee shop, a wooden sign that reads "早安咖啡", warm morning light, photo'
 ```
 - 兩個模型各用一個 session（`t2i` 和 `t2i-z`），切換模型不用重新載入；`stop` 沒指定 `-s` 時兩個都會關
-- Z-Image-Turbo（阿里巴巴通義，6B，Apache 2.0，不用登入 Hugging Face）中文和英文 prompt 都能用；要在圖裡畫字，把文字放在引號裡
+- Z-Image-Turbo（阿里巴巴通義，6B，Apache 2.0，不用登入 Hugging Face）官方說支援中英文 prompt；這裡實測過的是英文 prompt 搭配中文字。要在圖裡畫字，把文字放在引號裡
 - Z-Image-Turbo 不支援 `--negative`，不想要的東西改用正面描述
 - L4 的顯存（24 GB）放不下全部模型，所以文字編碼器平常放在 CPU，只在處理 prompt 時才搬上 GPU。這樣每張多花約 5 秒，但能同時使用去背和 CLIP 檢查
 - L4 暫時開不了（Service Unavailable）時會自動重試 3 次；連到 kernel 的連線中斷時也會自動重試一次
@@ -79,7 +79,7 @@ python3 scripts/t2i.py generate -p "a cute cartoon knight game character, full b
 | 2 | 參數錯誤 |
 | 3 | 需要登入（JSON 內附 `login_steps`） |
 | 4 | 無法安裝 colab CLI |
-| 5 | 拿不到 GPU（配額不足） |
+| 5 | 拿不到 GPU（帳號沒有額度或權限；暫時性的 Service Unavailable 已經自動重試 3 次） |
 | 6 | 生圖或下載失敗 |
 | 7 | 驗證沒通過 |
 | 8 | 不支援的作業系統 |
@@ -89,10 +89,13 @@ python3 ~/.claude/skills/colab-text-to-image/scripts/t2i.py generate -p "a light
 ```
 JSON 的欄位格式請見 SKILL.md。
 
+`doctor`、`generate`、`stop` 都支援 `--json`。
+
 ## 用完記得關機（閒置也會消耗 compute units）
 ```bash
 python3 scripts/t2i.py stop
 ```
+沒指定 `-s` 時會把 `t2i` 和 `t2i-z` 都關掉；只想關其中一個時用 `-s t2i-z`。
 
 ## 安裝成 Claude Code skill
 ```bash

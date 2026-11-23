@@ -53,7 +53,7 @@ Sign-in needs a human: Google shows an authorization code in the browser that mu
 python3 $T2I generate -p "<prompt>" [-m sdxl-turbo|z-image-turbo] [-n 1] [-W ..] [-H ..] [--steps ..] [--seed N] [--negative "<text>"] [--remove-bg] [-o <dir>] [--stop] --json
 ```
 - `sdxl-turbo`: write the prompt in English (translate if needed); short and concrete. Weak at text/letters and exact counts above ~3.
-- `z-image-turbo`: English or Chinese prompts both work; longer, detailed descriptions help. For text in the image, put the exact words in quotes, e.g. `a wooden sign that reads "早安咖啡"`.
+- `z-image-turbo`: English prompts are tested; Chinese prompts are officially supported but untested here, so prefer English with any in-image text quoted in its original language. Longer, detailed descriptions help. For text in the image, put the exact words in quotes, e.g. `a wooden sign that reads "早安咖啡"`.
 - `-o`: save next to where the image is needed (e.g. the project's `assets/`); default `./outputs`.
 - First call in a new session: ~2 min for `sdxl-turbo`, ~4 min for `z-image-turbo` (VM + model download).
 - Sizes/steps: `sdxl-turbo` 256–1024 px (512 native, ≤768 recommended), steps 1–8 (default 1); `z-image-turbo` 512–1280 px (1024 native), steps 1–16 (default 9).
