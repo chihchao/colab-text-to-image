@@ -1,6 +1,6 @@
 ---
 name: colab-text-to-image
-description: Generate images from a text prompt with SDXL-Turbo running on a Google Colab GPU through the official `colab` CLI, save the PNGs locally, and verify them. Use whenever an image/picture/illustration/icon/concept art must be created from text (文字生圖、生成圖片、畫一張圖) — whether the user asks directly or another task (a web page, slide, document, game asset) needs a generated image — or to make variations of a prompt. Handles CLI installation and guides Google sign-in.
+description: Generate images from a text prompt with SDXL-Turbo running on a Google Colab GPU through the official `colab` CLI, save the PNGs locally, optionally remove the background (transparent PNG), and verify them. Use whenever an image/picture/illustration/icon/concept art must be created from text (文字生圖、生成圖片、畫一張圖) — whether the user asks directly or another task (a web page, slide, document, game asset) needs a generated image — or to make variations of a prompt, or when a transparent/cut-out image is needed (去背、透明背景、sprite, sticker, icon). Handles CLI installation and guides Google sign-in.
 ---
 
 # Colab Text-to-Image (SDXL-Turbo)
@@ -46,16 +46,20 @@ python3 $T2I generate -p "<English prompt>" [-n 1] [-W 512] [-H 512] [--steps 1]
 - First call in a new session: ~2 min (VM + model download). Later calls in the same session: a few seconds per image.
 - `--steps` 1–4 (default 1). 512×512 is native; up to 768 is fine; range allowed 256–1024.
 - Use `--stop` for a one-off image; omit it when more images will follow.
+- `--remove-bg`: also saves `<name>_nobg.png` with a transparent background (BiRefNet, MIT license; ~10 s extra load the first time, ~1 s per image). Use it for game sprites, stickers, icons, product shots, or anything to be placed over other content. Unless the prompt already mentions a background, the script appends "isolated on a plain white background" (turn off with `--no-bg-hint`). Add "full body, centered" so the subject is not cut off by the frame.
 
 Exit codes: 0 ok · 2 bad arguments · 3 not signed in · 4 CLI missing · 5 could not get a GPU (quota; retry later or `--gpu L4`) · 6 generation/download failed (see `detail`; for CUDA OOM lower size/`-n`) · 7 verification failed.
 
 ### 3. Verify — every time, before reporting success
 Automatic checks (in JSON, per image under `checks`): file downloaded, valid PNG, exact requested size, not blank (`pixel_std`), and `clip_score` = prompt–image match (CLIP ViT-B/32 × 100). Measured: matching images score ~30–37; an unrelated prompt scored ~12. Below 22 adds a warning; `--min-score X` turns it into a failure (exit 7).
 
+With `--remove-bg`, each image also gets `nobg_path` and `nobg_checks`: cut-out downloaded, same size, has an alpha channel, `transparent_ratio` between 5% and 97% (otherwise the background was not removed or the subject was lost → failure), and `edge_opaque_ratio` (opaque pixels on the border; above 10% warns that the subject touches the frame or background was left).
+
 Then **look at every image yourself** (Read the PNG file) and check it against the user's actual requirements, not just the prompt:
 - Subject(s) present and correct; requested count of objects/people
 - Requested style, colors, setting, composition/orientation
 - No obvious defects that matter for the use (distorted faces/hands, garbled text, cut-off subject)
+- With `--remove-bg`, open the `_nobg.png` too: the whole subject is kept (no missing limbs, hair, weapons or props), no leftover background patches or halos. Thin gaps (between an arm and a sword) should be transparent.
 
 If an image fails: regenerate with a different `--seed` and/or a more specific prompt (move the most important element to the front, add the missing detail). Retry at most 2 times, then show the best result and say honestly what does not match. Never claim an image matches without having looked at it.
 
@@ -68,13 +72,18 @@ python3 $T2I stop --json
 ```
 
 ## JSON output (generate)
-```json
+```jsonc
 {"ok": true, "prompt": "...", "model": "stabilityai/sdxl-turbo", "session": "t2i",
  "session_reused": true, "session_stopped": false, "seconds": 9.0, "all_passed": true,
+ "remove_bg": false,
  "images": [{"path": "/abs/outputs/20261123-203838_1.png", "seed": 7, "width": 512, "height": 512,
              "checks": {"exists": true, "bytes": 369547, "png_valid": true, "size_ok": true,
                         "not_blank": true, "clip_score": 36.08, "clip_ok": true},
              "problems": [], "warnings": [], "passed": true}],
+ // with --remove-bg each image also has:
+ //   "nobg_path": "/abs/outputs/..._1_nobg.png",
+ //   "nobg_checks": {"exists": true, "size_ok": true, "has_alpha": true,
+ //                   "transparent_ratio": 0.42, "edge_opaque_ratio": 0.01}
  "next_step": "Look at each image and confirm it shows what was asked ..."}
 ```
 On failure: `{"ok": false, "exit_code": N, "error": "...", ...}` plus `login_steps`, `hint`, `detail` or the per-image `problems` when relevant.

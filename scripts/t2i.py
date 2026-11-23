@@ -208,12 +208,56 @@ def check_login(colab: str, env: dict) -> None:
 # Local verification
 # --------------------------------------------------------------------------
 
-def png_info(path: Path) -> tuple[int, int]:
+PNG_COLOR_RGBA, PNG_COLOR_GRAY_ALPHA = 6, 4
+
+
+def png_info(path: Path) -> tuple[int, int, int]:
+    """Return (width, height, color_type) from the PNG IHDR chunk."""
     with path.open("rb") as f:
-        head = f.read(24)
-    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        head = f.read(26)
+    if len(head) < 26 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
         raise ValueError("not a valid PNG file")
-    return struct.unpack(">II", head[16:24])
+    w, h = struct.unpack(">II", head[16:24])
+    return w, h, head[25]
+
+
+def verify_cutout(local: Path, meta: dict, want_w: int, want_h: int) -> dict:
+    """Checks for the transparent-background copy."""
+    checks: dict = {}
+    problems: list[str] = []
+    warnings: list[str] = []
+    checks["exists"] = local.is_file()
+    if not checks["exists"]:
+        problems.append("cut-out file was not downloaded")
+    else:
+        try:
+            w, h, color = png_info(local)
+            checks["size_ok"] = (w, h) == (want_w, want_h)
+            checks["has_alpha"] = color in (PNG_COLOR_RGBA, PNG_COLOR_GRAY_ALPHA)
+            if not checks["size_ok"]:
+                problems.append(f"cut-out size {w}x{h} != {want_w}x{want_h}")
+            if not checks["has_alpha"]:
+                problems.append("cut-out PNG has no alpha channel")
+        except (OSError, ValueError) as e:
+            problems.append(f"cut-out: {e}")
+
+    tr = meta.get("transparent_ratio")
+    if tr is not None:
+        checks["transparent_ratio"] = tr
+        if tr < 0.05:
+            problems.append(f"background was not removed (only {tr:.0%} transparent); "
+                            "use a plainer background in the prompt")
+        elif tr > 0.97:
+            problems.append(f"almost everything was removed ({tr:.0%} transparent); "
+                            "the subject was probably not detected")
+    edge = meta.get("edge_opaque_ratio")
+    if edge is not None:
+        checks["edge_opaque_ratio"] = edge
+        if edge > 0.10:
+            warnings.append(f"{edge:.0%} of the border is opaque: the subject may be cut off "
+                            "by the frame or background was left; add 'full body, centered' "
+                            "or check the cut-out")
+    return {"checks": checks, "problems": problems, "warnings": warnings}
 
 
 def verify_image(local: Path, meta: dict, want_w: int, want_h: int,
@@ -231,7 +275,7 @@ def verify_image(local: Path, meta: dict, want_w: int, want_h: int,
         problems.append(f"file is suspiciously small ({size} bytes)")
     if checks["exists"]:
         try:
-            w, h = png_info(local)
+            w, h, _ = png_info(local)
             checks["png_valid"] = True
             checks["size_ok"] = (w, h) == (want_w, want_h)
             if not checks["size_ok"]:
@@ -319,6 +363,7 @@ def _exec_generate(colab: str, env: dict, a, tag: str) -> dict:
         "T2I_WIDTH": str(a.width), "T2I_HEIGHT": str(a.height),
         "T2I_STEPS": str(a.steps), "T2I_SEED": "" if a.seed is None else str(a.seed),
         "T2I_TAG": tag, "T2I_SCORE": "0" if a.no_score else "1",
+        "T2I_REMOVE_BG": "1" if a.remove_bg else "0",
     }
     args = ["exec", "-s", a.session, "-f", str(GENERATE_PY), "--timeout", "900"]
     for k, v in params.items():          # values are passed as data, never as code
@@ -346,6 +391,11 @@ def cmd_generate(a) -> dict:
         if not (256 <= v <= 1024):
             raise T2IError(EXIT_USAGE, "--width/--height must be 256-1024")
     want_w, want_h = a.width // 8 * 8, a.height // 8 * 8
+    a.prompt = a.prompt.strip()
+    if a.remove_bg and not a.no_bg_hint and "background" not in a.prompt.lower():
+        # A plain backdrop makes the cut-out much cleaner.
+        a.prompt += ", isolated on a plain white background"
+        log(f"prompt for cut-out: {a.prompt}")
 
     colab = ensure_colab(auto_install=not a.no_install)
     env = colab_env(colab)
@@ -382,9 +432,27 @@ def cmd_generate(a) -> dict:
         if code != 0:
             v["passed"] = False
             v["problems"].insert(0, f"colab download exited {code}")
-        images.append({"path": str(local), "remote_path": remote, "seed": meta["seed"],
-                       "width": want_w, "height": want_h, **v})
+        entry = {"path": str(local), "remote_path": remote, "seed": meta["seed"],
+                 "width": want_w, "height": want_h, **v}
         print(local, file=sys.stderr if a.json else sys.stdout, flush=True)
+        if a.remove_bg:
+            if "nobg_path" not in meta:
+                entry["passed"] = False
+                entry["problems"].append("background removal produced no file")
+            else:
+                nobg_local = out_dir / Path(meta["nobg_path"]).name
+                code, _ = run_colab(colab, env, ["download", "-s", a.session,
+                                                 meta["nobg_path"], str(nobg_local)], timeout=300)
+                cv = verify_cutout(nobg_local, meta, want_w, want_h)
+                if code != 0:
+                    cv["problems"].insert(0, f"colab download of cut-out exited {code}")
+                entry["nobg_path"] = str(nobg_local)
+                entry["nobg_checks"] = cv["checks"]
+                entry["problems"] += cv["problems"]
+                entry["warnings"] += cv["warnings"]
+                entry["passed"] = entry["passed"] and not cv["problems"]
+                print(nobg_local, file=sys.stderr if a.json else sys.stdout, flush=True)
+        images.append(entry)
 
     stopped = False
     if a.stop:
@@ -396,13 +464,17 @@ def cmd_generate(a) -> dict:
 
     report = {
         "prompt": a.prompt, "negative": a.negative or "", "model": result.get("model"),
-        "steps": a.steps, "session": a.session, "session_reused": reused,
+        "steps": a.steps, "remove_bg": a.remove_bg,
+        "session": a.session, "session_reused": reused,
         "session_stopped": stopped, "seconds": round(time.time() - t0, 1),
         "images": images,
         "all_passed": all(i["passed"] for i in images) and len(images) == a.num,
         "next_step": ("Look at each image and confirm it shows what was asked "
                       "(subject, style, count, key details). If not, regenerate with "
-                      "a new --seed or a more specific prompt."),
+                      "a new --seed or a more specific prompt."
+                      + (" Also open each *_nobg.png: the whole subject should be kept "
+                         "(no missing limbs/hair/props) and no background patches left."
+                         if a.remove_bg else "")),
     }
     if len(images) != a.num:
         report["problem"] = f"expected {a.num} images, got {len(images)}"
@@ -451,6 +523,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("-o", "--out", default="./outputs")
     g.add_argument("--gpu", default="T4")
     g.add_argument("--stop", action="store_true", help="release the VM afterwards")
+    g.add_argument("--remove-bg", action="store_true",
+                   help="also save a transparent-background copy (*_nobg.png, BiRefNet)")
+    g.add_argument("--no-bg-hint", action="store_true",
+                   help="with --remove-bg, do not append 'plain white background' to the prompt")
     g.add_argument("--no-score", action="store_true",
                    help="skip the CLIP prompt-match score")
     g.add_argument("--min-score", type=float, default=None,

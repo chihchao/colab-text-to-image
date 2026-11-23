@@ -1,13 +1,13 @@
 # colab-cli-texttoimage-skill
 
-用 Google 官方 Colab CLI（`google-colab-cli`）在 Colab 的 T4 GPU 上跑 **SDXL-Turbo** 文字生圖，把圖片下載回本機，並自動驗證結果。可以當作 Claude Code skill 使用，也能讓其他 AI agent 或程式直接呼叫。
+用 Google 官方 Colab CLI（`google-colab-cli`）在 Colab 的 T4 GPU 上跑 **SDXL-Turbo** 文字生圖，把圖片下載回本機，可以選擇自動去背（輸出透明 PNG），並自動驗證結果。可以當作 Claude Code skill 使用，也能讓其他 AI agent 或程式直接呼叫。
 
 ## 檔案
 | 檔案 | 用途 |
 |---|---|
 | `SKILL.md` | Claude Code skill 的定義：完整流程（檢查 → 登入 → 生成 → 驗證 → 關機） |
 | `scripts/t2i.py` | 主程式（只用 Python 標準函式庫），子指令有 `doctor` / `login` / `generate` / `stop` |
-| `scripts/generate.py` | 在 Colab kernel 裡執行：生圖、計算像素統計和 CLIP 吻合分數 |
+| `scripts/generate.py` | 在 Colab kernel 裡執行：生圖、去背（BiRefNet）、計算像素統計和 CLIP 吻合分數 |
 | `scripts/t2i.sh` | 舊介面的相容腳本：`t2i.sh -p "..."` 等同 `generate`，`t2i.sh --stop-only` 等同 `stop` |
 
 ## 需求
@@ -33,7 +33,17 @@ python3 scripts/t2i.py login
 ```bash
 python3 scripts/t2i.py generate -p "two orange cats sleeping on a blue sofa, photo" -n 2
 ```
-參數：`-n` 張數（1–8）、`-W/-H` 尺寸（預設 512，可設 256–1024，會調整成 8 的倍數；T4 上建議不超過 768）、`--steps` 步數（預設 1，建議 1–4，最多 8）、`-s` session 名稱（預設 `t2i`）、`--seed`、`--negative`、`-o` 輸出資料夾、`--gpu`（預設 T4）、`--stop`（下載完就關機）、`--min-score`（CLIP 分數低於這個值就判定失敗）、`--no-score`（不計算 CLIP 分數）。
+參數：`-n` 張數（1–8）、`-W/-H` 尺寸（預設 512，可設 256–1024，會調整成 8 的倍數；T4 上建議不超過 768）、`--steps` 步數（預設 1，建議 1–4，最多 8）、`-s` session 名稱（預設 `t2i`）、`--seed`、`--negative`、`-o` 輸出資料夾、`--gpu`（預設 T4）、`--stop`（下載完就關機）、`--min-score`（CLIP 分數低於這個值就判定失敗）、`--no-score`（不計算 CLIP 分數）、`--remove-bg`（另外輸出去背的透明 PNG）、`--no-bg-hint`（去背時不自動在 prompt 後面加上背景描述）。
+
+### 去背
+```bash
+python3 scripts/t2i.py generate -p "a cute cartoon knight game character, full body, centered" --remove-bg
+```
+- 除了原圖，還會另外輸出 `<檔名>_nobg.png`，背景是透明的。適合遊戲角色、貼圖、圖示這類要疊在其他畫面上的素材
+- 使用 [BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet)（MIT 授權，可以商用）。模型版本固定在某一次 commit，因為它會從 Hugging Face 下載並執行模型自帶的程式碼
+- prompt 裡沒有提到背景時，會自動加上 `isolated on a plain white background`，讓去背更乾淨。不想自動加的話，用 `--no-bg-hint` 關閉
+- 第一次使用會多花約 10 秒載入模型，之後每張只多約 1 秒
+- 驗證項目：去背檔有成功下載、有透明通道、透明區域佔 5%–97%（超出這個範圍代表背景沒去掉，或主體被一起去掉了），以及圖片邊框上的不透明比例（超過 10% 會警告主體可能被畫面切到）
 
 ### 速度
 - 新 session 第一次生圖：約 2 分鐘（開 T4 VM 約 1 分鐘，加上下載並載入模型）
