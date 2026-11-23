@@ -1,19 +1,21 @@
-# @title SDXL-Turbo text-to-image
+# @title Text-to-image (SDXL-Turbo / Z-Image-Turbo)
 """Runs inside a Colab kernel via `colab exec -f generate.py --env ...`.
 
 Parameters arrive as environment variables (set with `colab exec --env`):
+  T2I_MODEL     "sdxl-turbo" (default, T4) or "z-image-turbo" (L4, better quality,
+                can render Chinese/English text)
   T2I_PROMPT    (required) text prompt
   T2I_NEGATIVE  negative prompt (default: empty)
   T2I_N         number of images (default 1)
   T2I_WIDTH     width in px, multiple of 8 (default 512)
   T2I_HEIGHT    height in px, multiple of 8 (default 512)
-  T2I_STEPS     inference steps, 1-4 for Turbo (default 1)
+  T2I_STEPS     inference steps (default: model's own, 1 for SDXL-Turbo, 9 for Z-Image)
   T2I_SEED      integer seed; empty = random
   T2I_TAG       filename prefix (default: timestamp)
   T2I_SCORE     "1" to compute a CLIP prompt-match score per image (default 1)
   T2I_REMOVE_BG "1" to also save a transparent-background copy (BiRefNet)
 
-The loaded pipeline is cached in kernel globals as `_T2I_PIPE`, so later calls
+The loaded pipelines are cached in kernel globals (`_T2I_PIPES`), so later calls
 in the same session skip the model load (CLIP is cached as `_T2I_CLIP`,
 BiRefNet as `_T2I_BG`). Results are printed on one line starting with
 `T2I_OUTPUTS=` as JSON:
@@ -32,7 +34,17 @@ import subprocess
 import sys
 import time
 
-MODEL_ID = "stabilityai/sdxl-turbo"
+MODELS = {
+    # SDXL-Turbo: ~7 GB fp16, fits a T4 entirely. No CFG, 1-4 steps.
+    "sdxl-turbo": {"id": "stabilityai/sdxl-turbo", "revision": None, "steps": 1},
+    # Z-Image-Turbo (Tongyi-MAI, Apache-2.0): 6B DiT + Qwen3-4B text encoder,
+    # bf16. Everything on the GPU peaks at ~23 GB on an L4 (24 GB) and runs out
+    # of memory once CLIP/BiRefNet are loaded too, so the text encoder (~8 GB)
+    # lives on the CPU and visits the GPU only to encode the prompt.
+    "z-image-turbo": {"id": "Tongyi-MAI/Z-Image-Turbo",
+                      "revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+                      "steps": 9},
+}
 CLIP_ID = "openai/clip-vit-base-patch32"
 BG_ID = "ZhengPeng7/BiRefNet"  # MIT license
 # Pinned: BiRefNet loads its own Python code from the Hub (trust_remote_code),
@@ -59,25 +71,66 @@ def _ensure_deps():
         )
 
 
-def _get_pipe():
-    pipe = globals().get("_T2I_PIPE")
-    if pipe is not None:
-        return pipe
+def _get_pipe(model):
+    pipes = globals().setdefault("_T2I_PIPES", {})
+    if model in pipes:
+        return pipes[model]
     _ensure_deps()
     import torch
-    from diffusers import AutoPipelineForText2Image
+    import diffusers
 
     if not torch.cuda.is_available():
-        raise RuntimeError("No CUDA GPU in this session; create it with --gpu T4.")
-    print(f"[t2i] loading {MODEL_ID} (first run downloads ~7 GB) ...", flush=True)
+        raise RuntimeError("No CUDA GPU in this session.")
+    spec = MODELS[model]
     t0 = time.time()
-    pipe = AutoPipelineForText2Image.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float16, variant="fp16"
-    ).to("cuda")
+    if model == "sdxl-turbo":
+        print(f"[t2i] loading {spec['id']} (first run downloads ~7 GB) ...", flush=True)
+        pipe = diffusers.AutoPipelineForText2Image.from_pretrained(
+            spec["id"], torch_dtype=torch.float16, variant="fp16").to("cuda")
+    else:
+        if not hasattr(diffusers, "ZImagePipeline"):
+            print("[t2i] upgrading diffusers for Z-Image ...", flush=True)
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "diffusers"],
+                           check=True)
+            raise RuntimeError("diffusers was upgraded; run `colab restart-kernel` and retry.")
+        free_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        if free_gb < 20:
+            raise RuntimeError(f"Z-Image-Turbo needs a 24 GB GPU (L4 or better); "
+                               f"this one has {free_gb:.0f} GB.")
+        print(f"[t2i] loading {spec['id']} (first run downloads ~20 GB, 2-3 min) ...",
+              flush=True)
+        pipe = diffusers.ZImagePipeline.from_pretrained(
+            spec["id"], torch_dtype=torch.bfloat16, revision=spec["revision"])
+        pipe.transformer.to("cuda")
+        pipe.vae.to("cuda")
+        pipe.text_encoder.to("cpu")
     pipe.set_progress_bar_config(disable=True)
     print(f"[t2i] model ready in {time.time() - t0:.0f}s", flush=True)
-    globals()["_T2I_PIPE"] = pipe
+    pipes[model] = pipe
     return pipe
+
+
+def _generate_one(model, pipe, prompt, negative, steps, width, height, seed):
+    import torch
+
+    gen = torch.Generator("cuda").manual_seed(seed)
+    if model == "sdxl-turbo":
+        return pipe(prompt=prompt, negative_prompt=negative, num_inference_steps=steps,
+                    guidance_scale=0.0,  # SDXL-Turbo is trained without CFG
+                    width=width, height=height, generator=gen).images[0]
+    # Z-Image-Turbo: encode on the GPU, then send the text encoder back to the CPU.
+    te = pipe.text_encoder
+    te.to("cuda")
+    try:
+        with torch.no_grad():
+            embeds, _ = pipe.encode_prompt(prompt=prompt, device="cuda",
+                                           do_classifier_free_guidance=False)
+    finally:
+        te.to("cpu")
+        torch.cuda.empty_cache()
+    return pipe(prompt_embeds=embeds, num_inference_steps=steps,
+                guidance_scale=0.0,  # Turbo distillation: no CFG, negative prompt unused
+                width=width, height=height, generator=gen).images[0]
 
 
 def _get_clip():
@@ -161,6 +214,9 @@ def _remove_bg(image):
 def _main():
     import torch
 
+    model = os.environ.get("T2I_MODEL", "sdxl-turbo").strip() or "sdxl-turbo"
+    if model not in MODELS:
+        raise ValueError(f"unknown T2I_MODEL {model!r}; choose from {list(MODELS)}")
     prompt = os.environ.get("T2I_PROMPT", "").strip()
     if not prompt:
         raise ValueError("T2I_PROMPT is empty")
@@ -168,28 +224,19 @@ def _main():
     n = max(1, min(_env_int("T2I_N", 1), 8))
     width = _env_int("T2I_WIDTH", 512) // 8 * 8
     height = _env_int("T2I_HEIGHT", 512) // 8 * 8
-    steps = max(1, min(_env_int("T2I_STEPS", 1), 8))
+    steps = max(1, min(_env_int("T2I_STEPS", MODELS[model]["steps"]), 16))
     seed = _env_int("T2I_SEED", random.randint(0, 2**31 - 1))
     tag = os.environ.get("T2I_TAG", "").strip() or time.strftime("%Y%m%d-%H%M%S")
     tag = "".join(c for c in tag if c.isalnum() or c in "-_") or "img"
 
     score = os.environ.get("T2I_SCORE", "1").strip() != "0"
     remove_bg = os.environ.get("T2I_REMOVE_BG", "0").strip() == "1"
-    pipe = _get_pipe()
+    pipe = _get_pipe(model)
     os.makedirs(OUT_DIR, exist_ok=True)
     images = []
     t0 = time.time()
     for i in range(n):
-        gen = torch.Generator("cuda").manual_seed(seed + i)
-        image = pipe(
-            prompt=prompt,
-            negative_prompt=negative,
-            num_inference_steps=steps,
-            guidance_scale=0.0,  # SDXL-Turbo is trained without CFG
-            width=width,
-            height=height,
-            generator=gen,
-        ).images[0]
+        image = _generate_one(model, pipe, prompt, negative, steps, width, height, seed + i)
         path = f"{OUT_DIR}/{tag}_{i + 1}.png"
         image.save(path)
         import numpy as np
@@ -212,7 +259,8 @@ def _main():
             extra += f", transparent {info['transparent_ratio']:.0%}"
         print(f"[t2i] saved {path} (seed {seed + i}{extra})", flush=True)
     print(f"[t2i] {n} image(s) in {time.time() - t0:.1f}s", flush=True)
-    print("T2I_OUTPUTS=" + json.dumps({"model": MODEL_ID, "images": images}), flush=True)
+    print("T2I_OUTPUTS=" + json.dumps({"model": MODELS[model]["id"], "images": images}),
+          flush=True)
 
 
 _main()

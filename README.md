@@ -1,19 +1,20 @@
 # colab-cli-texttoimage-skill
 
-用 Google 官方 Colab CLI（`google-colab-cli`）在 Colab 的 T4 GPU 上跑 **SDXL-Turbo** 文字生圖，把圖片下載回本機，可以選擇自動去背（輸出透明 PNG），並自動驗證結果。可以當作 Claude Code skill 使用，也能讓其他 AI agent 或程式直接呼叫。
+用 Google 官方 Colab CLI（`google-colab-cli`）在 Colab GPU 上文字生圖，可以選 **SDXL-Turbo**（T4，快速又便宜）或 **Z-Image-Turbo**（L4，高品質，能畫中英文字），把圖片下載回本機，可以選擇自動去背（輸出透明 PNG），並自動驗證結果。可以當作 Claude Code skill 使用，也能讓其他 AI agent 或程式直接呼叫。
 
 ## 檔案
 | 檔案 | 用途 |
 |---|---|
 | `SKILL.md` | Claude Code skill 的定義：完整流程（檢查 → 登入 → 生成 → 驗證 → 關機） |
 | `scripts/t2i.py` | 主程式（只用 Python 標準函式庫），子指令有 `doctor` / `login` / `generate` / `stop` |
-| `scripts/generate.py` | 在 Colab kernel 裡執行：生圖、去背（BiRefNet）、計算像素統計和 CLIP 吻合分數 |
+| `scripts/generate.py` | 在 Colab kernel 裡執行：生圖（SDXL-Turbo / Z-Image-Turbo）、去背（BiRefNet）、計算像素統計和 CLIP 吻合分數 |
 | `scripts/t2i.sh` | 舊介面的相容腳本：`t2i.sh -p "..."` 等同 `generate`，`t2i.sh --stop-only` 等同 `stop` |
 
 ## 需求
 - macOS 或 Linux（Colab CLI 不支援 Windows）
 - `python3`（3.8 以上），本機不需要另外安裝 Python 套件
 - 一個可以使用 Colab 的 Google 帳號；免費方案通常可以用 T4，但可用時數有限制
+- Z-Image-Turbo 需要 L4，要有 Colab compute units（付費方案，或 Google AI Pro / Ultra 附的額度）
 
 ## 第一次使用
 ```bash
@@ -33,7 +34,23 @@ python3 scripts/t2i.py login
 ```bash
 python3 scripts/t2i.py generate -p "two orange cats sleeping on a blue sofa, photo" -n 2
 ```
-參數：`-n` 張數（1–8）、`-W/-H` 尺寸（預設 512，可設 256–1024，會調整成 8 的倍數；T4 上建議不超過 768）、`--steps` 步數（預設 1，建議 1–4，最多 8）、`-s` session 名稱（預設 `t2i`）、`--seed`、`--negative`、`-o` 輸出資料夾、`--gpu`（預設 T4）、`--stop`（下載完就關機）、`--min-score`（CLIP 分數低於這個值就判定失敗）、`--no-score`（不計算 CLIP 分數）、`--remove-bg`（另外輸出去背的透明 PNG）、`--no-bg-hint`（去背時不自動在 prompt 後面加上背景描述）。
+參數：`-m` 模型（`sdxl-turbo` 或 `z-image-turbo`，見下表）、`-n` 張數（1–8）、`-W/-H` 尺寸（會調整成 8 的倍數，預設值和範圍依模型而定）、`--steps` 步數（預設值依模型而定）、`-s` session 名稱（預設 `t2i` 或 `t2i-z`）、`--seed`、`--negative`、`-o` 輸出資料夾、`--gpu`（預設依模型而定）、`--stop`（下載完就關機）、`--min-score`（CLIP 分數低於這個值就判定失敗）、`--no-score`（不計算 CLIP 分數）、`--remove-bg`（另外輸出去背的透明 PNG）、`--no-bg-hint`（去背時不自動在 prompt 後面加上背景描述）。
+
+### 選擇模型
+| `-m` | GPU | 預設尺寸 | 尺寸範圍 | 預設步數 | 每張速度（session 已開著時） | 適合 |
+|---|---|---|---|---|---|---|
+| `sdxl-turbo`（預設） | T4 | 512 | 256–1024 | 1（最多 8） | 約 2 秒 | 草稿、快速多試幾張、省 compute units |
+| `z-image-turbo` | L4 | 1024 | 512–1280 | 9（最多 16） | 約 21 秒 | 正式素材、複雜畫面、需要精準照 prompt 畫、**圖裡要有中英文字** |
+
+```bash
+python3 scripts/t2i.py generate -m z-image-turbo -p 'a cozy coffee shop, a wooden sign that reads "早安咖啡", warm morning light, photo'
+```
+- 兩個模型各用一個 session（`t2i` 和 `t2i-z`），切換模型不用重新載入；`stop` 沒指定 `-s` 時兩個都會關
+- Z-Image-Turbo（阿里巴巴通義，6B，Apache 2.0，不用登入 Hugging Face）中文和英文 prompt 都能用；要在圖裡畫字，把文字放在引號裡
+- Z-Image-Turbo 不支援 `--negative`，不想要的東西改用正面描述
+- L4 的顯存（24 GB）放不下全部模型，所以文字編碼器平常放在 CPU，只在處理 prompt 時才搬上 GPU。這樣每張多花約 5 秒，但能同時使用去背和 CLIP 檢查
+- L4 暫時開不了（Service Unavailable）時會自動重試 3 次；連到 kernel 的連線中斷時也會自動重試一次
+- 實測 L4 每小時約 1.94 compute units
 
 ### 去背
 ```bash
@@ -46,8 +63,8 @@ python3 scripts/t2i.py generate -p "a cute cartoon knight game character, full b
 - 驗證項目：去背檔有成功下載、有透明通道、透明區域佔 5%–97%（超出這個範圍代表背景沒去掉，或主體被一起去掉了），以及圖片邊框上的不透明比例（超過 10% 會警告主體可能被畫面切到）
 
 ### 速度
-- 新 session 第一次生圖：約 2 分鐘（開 T4 VM 約 1 分鐘，加上下載並載入模型）
-- 同一個 session 之後的呼叫：每次約 9 秒，其中生圖本身每張 1–3 秒，其餘是連線和下載的時間
+- 新 session 第一次生圖：SDXL-Turbo 約 2 分鐘；Z-Image-Turbo 約 4 分鐘（開 VM，加上下載並載入約 20 GB 的模型）
+- 同一個 session 之後的呼叫：SDXL-Turbo 每次約 9 秒（生圖本身每張 1–3 秒，其餘是連線和下載的時間）；Z-Image-Turbo 每張約 21 秒，整個指令約 27 秒
 - 圖片預設存到執行指令時所在資料夾的 `./outputs/`
 
 ### 自動驗證項目
@@ -91,4 +108,4 @@ ln -s "$PWD" ~/.claude/skills/colab-text-to-image
 ## 授權
 本專案以 [MIT License](LICENSE) 授權。
 
-使用的模型和服務另有各自的授權與條款：SDXL-Turbo 採用 Stability AI 的 [SDXL-Turbo 授權](https://huggingface.co/stabilityai/sdxl-turbo)（商業用途需要另外確認），Colab 則適用 Google Colab 的服務條款。
+使用的模型和服務另有各自的授權與條款：SDXL-Turbo 採用 Stability AI 的 [SDXL-Turbo 授權](https://huggingface.co/stabilityai/sdxl-turbo)（商業用途需要另外確認）；[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) 和 [BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet) 分別採用 Apache 2.0 和 MIT 授權；Colab 則適用 Google Colab 的服務條款。

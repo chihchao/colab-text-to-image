@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Text-to-image on a Google Colab GPU (SDXL-Turbo) via the official `colab` CLI.
+"""Text-to-image on a Google Colab GPU via the official `colab` CLI.
+
+Models: sdxl-turbo (default; T4, fast and cheap) and z-image-turbo (L4; much
+better quality, follows prompts closely, renders Chinese/English text).
 
 Designed to be called by humans and by AI agents. Standard library only.
 
@@ -34,7 +37,16 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 GENERATE_PY = SCRIPT_DIR / "generate.py"
-DEFAULT_SESSION = "t2i"
+# Per-model defaults. Each model gets its own session name so a T4 session is
+# never asked to load a model that needs an L4.
+MODEL_DEFAULTS = {
+    "sdxl-turbo":    {"gpu": "T4", "session": "t2i",   "size": 512,  "steps": 1,
+                      "size_range": (256, 1024), "steps_range": (1, 8)},
+    "z-image-turbo": {"gpu": "L4", "session": "t2i-z", "size": 1024, "steps": 9,
+                      "size_range": (512, 1280), "steps_range": (1, 16)},
+}
+DEFAULT_MODEL = "sdxl-turbo"
+DEFAULT_SESSION = MODEL_DEFAULTS[DEFAULT_MODEL]["session"]
 AUTH_MARKER = "To authorize colab-cli"
 
 EXIT_OK, EXIT_USAGE, EXIT_LOGIN, EXIT_CLI = 0, 2, 3, 4
@@ -350,7 +362,12 @@ def _session_alive(colab: str, env: dict, session: str) -> bool:
 
 def _create_session(colab: str, env: dict, session: str, gpu: str) -> None:
     log(f"creating session '{session}' with GPU {gpu} (about a minute) ...")
-    code, out = run_colab(colab, env, ["new", "-s", session, "--gpu", gpu], timeout=600)
+    for attempt in range(3):
+        code, out = run_colab(colab, env, ["new", "-s", session, "--gpu", gpu], timeout=600)
+        if "READY" in out or "Service Unavailable" not in out:
+            break
+        log(f"{gpu} temporarily unavailable; retrying in 20 s ({attempt + 1}/3)")
+        time.sleep(20)
     if code != 0 or "READY" not in out:
         hint = ("No quota for this GPU right now. Retry later or try another --gpu."
                 if "400" in out else "See colab output above.")
@@ -359,7 +376,7 @@ def _create_session(colab: str, env: dict, session: str, gpu: str) -> None:
 
 def _exec_generate(colab: str, env: dict, a, tag: str) -> dict:
     params = {
-        "T2I_PROMPT": a.prompt, "T2I_NEGATIVE": a.negative or "", "T2I_N": str(a.num),
+        "T2I_MODEL": a.model, "T2I_PROMPT": a.prompt, "T2I_NEGATIVE": a.negative or "", "T2I_N": str(a.num),
         "T2I_WIDTH": str(a.width), "T2I_HEIGHT": str(a.height),
         "T2I_STEPS": str(a.steps), "T2I_SEED": "" if a.seed is None else str(a.seed),
         "T2I_TAG": tag, "T2I_SCORE": "0" if a.no_score else "1",
@@ -369,6 +386,10 @@ def _exec_generate(colab: str, env: dict, a, tag: str) -> dict:
     for k, v in params.items():          # values are passed as data, never as code
         args += ["--env", f"{k}={v}"]
     _, out = run_colab(colab, env, args, timeout=1800)
+    if "T2I_OUTPUTS=" not in out and "Connection was lost" in out:
+        # The kernel websocket drops now and then; the kernel itself survives.
+        log("connection to the Colab kernel was lost; retrying once")
+        _, out = run_colab(colab, env, args, timeout=1800)
     m = None
     for line in out.splitlines():
         if line.startswith("T2I_OUTPUTS="):
@@ -381,15 +402,26 @@ def _exec_generate(colab: str, env: dict, a, tag: str) -> dict:
 
 
 def cmd_generate(a) -> dict:
+    d = MODEL_DEFAULTS[a.model]
+    a.session = a.session or d["session"]
+    a.gpu = a.gpu or d["gpu"]
+    a.width = a.width or d["size"]
+    a.height = a.height or d["size"]
+    a.steps = a.steps or d["steps"]
     if not a.prompt or not a.prompt.strip():
         raise T2IError(EXIT_USAGE, "--prompt is required")
     if not (1 <= a.num <= 8):
         raise T2IError(EXIT_USAGE, "--num must be 1-8")
-    if not (1 <= a.steps <= 8):
-        raise T2IError(EXIT_USAGE, "--steps must be 1-8")
+    lo, hi = d["steps_range"]
+    if not (lo <= a.steps <= hi):
+        raise T2IError(EXIT_USAGE, f"--steps must be {lo}-{hi} for {a.model}")
+    lo, hi = d["size_range"]
     for v in (a.width, a.height):
-        if not (256 <= v <= 1024):
-            raise T2IError(EXIT_USAGE, "--width/--height must be 256-1024")
+        if not (lo <= v <= hi):
+            raise T2IError(EXIT_USAGE, f"--width/--height must be {lo}-{hi} for {a.model}")
+    if a.negative and a.model == "z-image-turbo":
+        log("note: z-image-turbo runs without CFG, so --negative has no effect; "
+            "describe what you want in the prompt instead")
     want_w, want_h = a.width // 8 * 8, a.height // 8 * 8
     a.prompt = a.prompt.strip()
     if a.remove_bg and not a.no_bg_hint and "background" not in a.prompt.lower():
@@ -464,6 +496,7 @@ def cmd_generate(a) -> dict:
 
     report = {
         "prompt": a.prompt, "negative": a.negative or "", "model": result.get("model"),
+        "gpu": a.gpu,
         "steps": a.steps, "remove_bg": a.remove_bg,
         "session": a.session, "session_reused": reused,
         "session_stopped": stopped, "seconds": round(time.time() - t0, 1),
@@ -489,8 +522,15 @@ def cmd_generate(a) -> dict:
 def cmd_stop(a) -> dict:
     colab = ensure_colab(auto_install=False)
     env = colab_env(colab)
-    _, out = run_colab(colab, env, ["stop", "-s", a.session], timeout=120)
-    return {"session": a.session, "stopped": "not found" not in out}
+    names = [a.session] if a.session else [d["session"] for d in MODEL_DEFAULTS.values()]
+    stopped = []
+    for name in names:
+        _, out = run_colab(colab, env, ["stop", "-s", name], timeout=120)
+        if "not found" not in out:
+            stopped.append(name)
+    if not stopped:
+        log("no t2i session was running")
+    return {"sessions_checked": names, "stopped": stopped}
 
 
 # --------------------------------------------------------------------------
@@ -505,7 +545,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print one JSON object on stdout (for agents)")
     common.add_argument("--no-install", action="store_true",
                         help="do not install the colab CLI if it is missing")
-    common.add_argument("-s", "--session", default=DEFAULT_SESSION)
+    common.add_argument("-s", "--session", default=None,
+                        help="session name (default: t2i for sdxl-turbo, t2i-z for z-image-turbo)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", parents=[common], help="check/install CLI and login")
@@ -514,14 +555,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("generate", parents=[common], help="generate images")
     g.add_argument("-p", "--prompt", required=True)
+    g.add_argument("-m", "--model", choices=list(MODEL_DEFAULTS), default=DEFAULT_MODEL,
+                   help="sdxl-turbo: T4, fast/cheap (default). z-image-turbo: L4, best "
+                        "quality, can draw Chinese/English text")
     g.add_argument("--negative", default="")
     g.add_argument("-n", "--num", type=int, default=1)
-    g.add_argument("-W", "--width", type=int, default=512)
-    g.add_argument("-H", "--height", type=int, default=512)
-    g.add_argument("--steps", type=int, default=1)
+    g.add_argument("-W", "--width", type=int, default=None,
+                   help="default 512 (sdxl-turbo) / 1024 (z-image-turbo)")
+    g.add_argument("-H", "--height", type=int, default=None)
+    g.add_argument("--steps", type=int, default=None,
+                   help="default 1 (sdxl-turbo) / 9 (z-image-turbo)")
     g.add_argument("--seed", type=int, default=None)
     g.add_argument("-o", "--out", default="./outputs")
-    g.add_argument("--gpu", default="T4")
+    g.add_argument("--gpu", default=None, help="default T4 (sdxl-turbo) / L4 (z-image-turbo)")
     g.add_argument("--stop", action="store_true", help="release the VM afterwards")
     g.add_argument("--remove-bg", action="store_true",
                    help="also save a transparent-background copy (*_nobg.png, BiRefNet)")
